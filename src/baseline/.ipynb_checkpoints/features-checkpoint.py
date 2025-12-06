@@ -1,8 +1,10 @@
 """
-Feature engineering script.
+Feature engineering script with GPU optimizations.
 """
 
+import gc
 import time
+from typing import Optional
 
 import joblib
 import numpy as np
@@ -15,313 +17,86 @@ from transformers import AutoModel, AutoTokenizer
 from . import config, constants
 
 
-def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates and adds user, book, and author aggregate features.
+def cleanup_gpu_memory() -> None:
+    """Очищает память GPU."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
 
-    Uses the training data to compute mean ratings and interaction counts
-    to prevent data leakage from the test set.
+
+def add_bert_features_gpu(
+    df: pd.DataFrame, 
+    descriptions_df: pd.DataFrame,
+    device: Optional[str] = None
+) -> pd.DataFrame:
+    """Adds BERT embeddings using GPU with memory optimizations."""
     
-    Теперь также использует has_read=0 записи для вычисления количества взаимодействий.
-
-    Args:
-        df (pd.DataFrame): The main DataFrame to add features to.
-        train_df (pd.DataFrame): The training portion of the data for calculations.
-
-    Returns:
-        pd.DataFrame: The DataFrame with new aggregate features.
-    """
-    print("Adding aggregate features...")
+    if device is None:
+        device = config.BERT_DEVICE
+        
+    print(f"\n🤖 Adding BERT embeddings using {device.upper()}...")
     
-    # Загружаем все train данные (включая has_read=0) для агрегатов
-    # Это делается один раз и сохраняется для повторного использования
-    if not hasattr(add_aggregate_features, '_all_train_data'):
-        print("  Loading all training data (including has_read=0) for aggregates...")
-        try:
-            # Загружаем все train данные из raw
-            all_train_df = pd.read_csv(
-                config.RAW_DATA_DIR / constants.TRAIN_FILENAME,
-                dtype={
-                    constants.COL_USER_ID: "int32",
-                    constants.COL_BOOK_ID: "int32",
-                    constants.COL_TARGET: "float32",
-                    constants.COL_HAS_READ: "int32",
-                },
-                parse_dates=[constants.COL_TIMESTAMP],
-            )
-            add_aggregate_features._all_train_data = all_train_df
-            print(f"  Loaded {len(all_train_df):,} total training records")
-        except Exception as e:
-            print(f"  Warning: Could not load has_read=0 data: {e}")
-            add_aggregate_features._all_train_data = train_df
+    # Если устройство CPU, уменьшаем batch size
+    batch_size = config.BERT_BATCH_SIZE if device.startswith("cuda") else 4
     
-    all_train_df = add_aggregate_features._all_train_data
-
-    # User-based aggregates
-    # Для среднего рейтинга используем только has_read=1
-    user_agg = train_df.groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
-    user_agg.columns = [
-        constants.COL_USER_ID,
-        constants.F_USER_MEAN_RATING,
-        constants.F_USER_RATINGS_COUNT,
-    ]
-    
-    # Добавляем общее количество взаимодействий (включая has_read=0)
-    user_total_interactions = all_train_df.groupby(constants.COL_USER_ID).size().reset_index()
-    user_total_interactions.columns = [constants.COL_USER_ID, 'user_total_interactions']
-    
-    # Добавляем количество to-read (has_read=0)
-    user_to_read_count = all_train_df[all_train_df[constants.COL_HAS_READ] == 0].groupby(
-        constants.COL_USER_ID).size().reset_index()
-    user_to_read_count.columns = [constants.COL_USER_ID, 'user_to_read_count']
-    
-    # Объединяем все user агрегаты
-    user_agg = user_agg.merge(user_total_interactions, on=constants.COL_USER_ID, how='left')
-    user_agg = user_agg.merge(user_to_read_count, on=constants.COL_USER_ID, how='left')
-    
-    # Заполняем пропуски
-    user_agg['user_total_interactions'] = user_agg['user_total_interactions'].fillna(0)
-    user_agg['user_to_read_count'] = user_agg['user_to_read_count'].fillna(0)
-    
-    # Добавляем ratio признаков
-    user_agg['user_read_ratio'] = user_agg[constants.F_USER_RATINGS_COUNT] / user_agg['user_total_interactions'].replace(0, 1)
-    user_agg['user_to_read_ratio'] = user_agg['user_to_read_count'] / user_agg['user_total_interactions'].replace(0, 1)
-
-    # Book-based aggregates
-    # Для среднего рейтинга книги используем только has_read=1
-    book_agg = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
-    book_agg.columns = [
-        constants.COL_BOOK_ID,
-        constants.F_BOOK_MEAN_RATING,
-        constants.F_BOOK_RATINGS_COUNT,
-    ]
-    
-    # Добавляем общее количество взаимодействий с книгой (включая has_read=0)
-    book_total_interactions = all_train_df.groupby(constants.COL_BOOK_ID).size().reset_index()
-    book_total_interactions.columns = [constants.COL_BOOK_ID, 'book_total_interactions']
-    
-    # Добавляем количество to-read для книги
-    book_to_read_count = all_train_df[all_train_df[constants.COL_HAS_READ] == 0].groupby(
-        constants.COL_BOOK_ID).size().reset_index()
-    book_to_read_count.columns = [constants.COL_BOOK_ID, 'book_to_read_count']
-    
-    # Объединяем все book агрегаты
-    book_agg = book_agg.merge(book_total_interactions, on=constants.COL_BOOK_ID, how='left')
-    book_agg = book_agg.merge(book_to_read_count, on=constants.COL_BOOK_ID, how='left')
-    
-    # Заполняем пропуски
-    book_agg['book_total_interactions'] = book_agg['book_total_interactions'].fillna(0)
-    book_agg['book_to_read_count'] = book_agg['book_to_read_count'].fillna(0)
-    
-    # Добавляем ratio признаков для книг
-    book_agg['book_read_ratio'] = book_agg[constants.F_BOOK_RATINGS_COUNT] / book_agg['book_total_interactions'].replace(0, 1)
-    book_agg['book_to_read_ratio'] = book_agg['book_to_read_count'] / book_agg['book_total_interactions'].replace(0, 1)
-    
-    # Популярность книги (общее количество взаимодействий)
-    book_agg['book_popularity'] = book_agg['book_total_interactions']
-
-    # Author-based aggregates
-    # Для авторов используем только has_read=1 для рейтинга
-    author_agg = train_df.groupby(constants.COL_AUTHOR_ID)[config.TARGET].agg(["mean"]).reset_index()
-    author_agg.columns = [constants.COL_AUTHOR_ID, constants.F_AUTHOR_MEAN_RATING]
-    
-    # Добавляем общее количество взаимодействий с автором
-    # Для этого нужно объединить book_id с author_id
-    book_author_map = train_df[[constants.COL_BOOK_ID, constants.COL_AUTHOR_ID]].drop_duplicates()
-    all_train_with_author = all_train_df.merge(book_author_map, on=constants.COL_BOOK_ID, how='left')
-    
-    author_total_interactions = all_train_with_author.groupby(
-        constants.COL_AUTHOR_ID).size().reset_index()
-    author_total_interactions.columns = [constants.COL_AUTHOR_ID, 'author_total_interactions']
-    
-    author_to_read_count = all_train_with_author[
-        all_train_with_author[constants.COL_HAS_READ] == 0
-    ].groupby(constants.COL_AUTHOR_ID).size().reset_index()
-    author_to_read_count.columns = [constants.COL_AUTHOR_ID, 'author_to_read_count']
-    
-    # Объединяем author агрегаты
-    author_agg = author_agg.merge(author_total_interactions, on=constants.COL_AUTHOR_ID, how='left')
-    author_agg = author_agg.merge(author_to_read_count, on=constants.COL_AUTHOR_ID, how='left')
-    
-    # Заполняем пропуски
-    author_agg['author_total_interactions'] = author_agg['author_total_interactions'].fillna(0)
-    author_agg['author_to_read_count'] = author_agg['author_to_read_count'].fillna(0)
-    
-    # Добавляем ratio для авторов
-    author_read_count = train_df.groupby(constants.COL_AUTHOR_ID).size().reset_index()
-    author_read_count.columns = [constants.COL_AUTHOR_ID, 'author_read_count']
-    author_agg = author_agg.merge(author_read_count, on=constants.COL_AUTHOR_ID, how='left')
-    author_agg['author_read_count'] = author_agg['author_read_count'].fillna(0)
-    author_agg['author_read_ratio'] = author_agg['author_read_count'] / author_agg['author_total_interactions'].replace(0, 1)
-
-    # Merge aggregates into the main dataframe
-    df = df.merge(user_agg, on=constants.COL_USER_ID, how="left")
-    df = df.merge(book_agg, on=constants.COL_BOOK_ID, how="left")
-    df = df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
-    
-    print(f"  Added {len(user_agg.columns) - 1} user aggregate features")
-    print(f"  Added {len(book_agg.columns) - 1} book aggregate features")
-    print(f"  Added {len(author_agg.columns) - 1} author aggregate features")
-    
-    return df
-
-
-
-def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates and adds the count of genres for each book.
-
-    Args:
-        df (pd.DataFrame): The main DataFrame to add features to.
-        book_genres_df (pd.DataFrame): DataFrame mapping books to genres.
-
-    Returns:
-        pd.DataFrame: The DataFrame with the new 'book_genres_count' column.
-    """
-    print("Adding genre features...")
-    genre_counts = book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID].count().reset_index()
-    genre_counts.columns = [
-        constants.COL_BOOK_ID,
-        constants.F_BOOK_GENRES_COUNT,
-    ]
-    return df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
-
-
-def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
-    """Adds TF-IDF features from book descriptions.
-
-    Trains a TF-IDF vectorizer only on training data descriptions to avoid
-    data leakage. Applies the vectorizer to all books and merges the features.
-
-    Args:
-        df (pd.DataFrame): The main DataFrame to add features to.
-        train_df (pd.DataFrame): The training portion for fitting the vectorizer.
-        descriptions_df (pd.DataFrame): DataFrame with book descriptions.
-
-    Returns:
-        pd.DataFrame: The DataFrame with TF-IDF features added.
-    """
-    print("Adding text features (TF-IDF)...")
-
-    # Ensure model directory exists
-    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    vectorizer_path = config.MODEL_DIR / constants.TFIDF_VECTORIZER_FILENAME
-
-    # Get unique books from train set
-    train_books = train_df[constants.COL_BOOK_ID].unique()
-
-    # Extract descriptions for training books only
-    train_descriptions = descriptions_df[descriptions_df[constants.COL_BOOK_ID].isin(train_books)].copy()
-    train_descriptions[constants.COL_DESCRIPTION] = train_descriptions[constants.COL_DESCRIPTION].fillna("")
-
-    # Check if vectorizer already exists (for prediction)
-    if vectorizer_path.exists():
-        print(f"Loading existing vectorizer from {vectorizer_path}")
-        vectorizer = joblib.load(vectorizer_path)
-    else:
-        # Fit vectorizer on training descriptions only
-        print("Fitting TF-IDF vectorizer on training descriptions...")
-        vectorizer = TfidfVectorizer(
-            max_features=config.TFIDF_MAX_FEATURES,
-            min_df=config.TFIDF_MIN_DF,
-            max_df=config.TFIDF_MAX_DF,
-            ngram_range=config.TFIDF_NGRAM_RANGE,
-        )
-        vectorizer.fit(train_descriptions[constants.COL_DESCRIPTION])
-        # Save vectorizer for use in prediction
-        joblib.dump(vectorizer, vectorizer_path)
-        print(f"Vectorizer saved to {vectorizer_path}")
-
-    # Transform all book descriptions
-    all_descriptions = descriptions_df[[constants.COL_BOOK_ID, constants.COL_DESCRIPTION]].copy()
-    all_descriptions[constants.COL_DESCRIPTION] = all_descriptions[constants.COL_DESCRIPTION].fillna("")
-
-    # Get descriptions in the same order as df[book_id]
-    # Create a mapping book_id -> description
-    description_map = dict(
-        zip(all_descriptions[constants.COL_BOOK_ID], all_descriptions[constants.COL_DESCRIPTION], strict=False)
-    )
-
-    # Get descriptions for books in df (in the same order)
-    df_descriptions = df[constants.COL_BOOK_ID].map(description_map).fillna("")
-
-    # Transform to TF-IDF features
-    tfidf_matrix = vectorizer.transform(df_descriptions)
-
-    # Convert sparse matrix to DataFrame
-    tfidf_feature_names = [f"tfidf_{i}" for i in range(tfidf_matrix.shape[1])]
-    tfidf_df = pd.DataFrame(
-        tfidf_matrix.toarray(),
-        columns=tfidf_feature_names,
-        index=df.index,
-    )
-
-    # Concatenate TF-IDF features with main DataFrame
-    df_with_tfidf = pd.concat([df.reset_index(drop=True), tfidf_df.reset_index(drop=True)], axis=1)
-
-    print(f"Added {len(tfidf_feature_names)} TF-IDF features.")
-    return df_with_tfidf
-
-
-def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
-    """Adds BERT embeddings from book descriptions.
-
-    Extracts 768-dimensional embeddings using a pre-trained Russian BERT model.
-    Embeddings are cached on disk to avoid recomputation on subsequent runs.
-
-    Args:
-        df (pd.DataFrame): The main DataFrame to add features to.
-        _train_df (pd.DataFrame): The training portion (for consistency, not used for BERT).
-        descriptions_df (pd.DataFrame): DataFrame with book descriptions.
-
-    Returns:
-        pd.DataFrame: The DataFrame with BERT embeddings added.
-    """
-    print("Adding text features (BERT embeddings)...")
-
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
     embeddings_path = config.MODEL_DIR / constants.BERT_EMBEDDINGS_FILENAME
 
     # Check if embeddings are already cached
     if embeddings_path.exists():
-        print(f"Loading cached BERT embeddings from {embeddings_path}")
-        embeddings_dict = joblib.load(embeddings_path)
+        print(f"   📂 Loading cached BERT embeddings from {embeddings_path}")
+        try:
+            embeddings_dict = joblib.load(embeddings_path)
+            print(f"   ✅ Loaded {len(embeddings_dict)} embeddings from cache")
+        except Exception as e:
+            print(f"   ⚠️  Failed to load cache: {e}, recomputing...")
+            embeddings_dict = None
     else:
-        print("Computing BERT embeddings (this may take a while)...")
-        print(f"Using device: {config.BERT_DEVICE}")
-
-        # Limit GPU memory usage to prevent OOM errors
-        if config.BERT_DEVICE == "cuda" and torch is not None:
-            torch.cuda.set_per_process_memory_fraction(config.BERT_GPU_MEMORY_FRACTION)
-            print(f"GPU memory limited to {config.BERT_GPU_MEMORY_FRACTION * 100:.0f}% of available memory")
-
+        embeddings_dict = None
+    
+    if embeddings_dict is None:
+        print(f"   ⚙️  Computing BERT embeddings on {device}...")
+        
+        # Очищаем память перед началом
+        cleanup_gpu_memory()
+        
         # Load tokenizer and model
+        print(f"   📥 Loading BERT model: {config.BERT_MODEL_NAME}")
         tokenizer = AutoTokenizer.from_pretrained(config.BERT_MODEL_NAME)
         model = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
-        model.to(config.BERT_DEVICE)
+        model.to(device)
         model.eval()
-
-        # Prepare descriptions: get unique book_id -> description mapping
+        model.requires_grad_(False)  # Отключаем градиенты для экономии памяти
+        
+        # Подготовка описаний
         all_descriptions = descriptions_df[[constants.COL_BOOK_ID, constants.COL_DESCRIPTION]].copy()
         all_descriptions[constants.COL_DESCRIPTION] = all_descriptions[constants.COL_DESCRIPTION].fillna("")
-
-        # Get unique books and their descriptions
+        
+        # Get unique books
         unique_books = all_descriptions.drop_duplicates(subset=[constants.COL_BOOK_ID])
         book_ids = unique_books[constants.COL_BOOK_ID].to_numpy()
         descriptions = unique_books[constants.COL_DESCRIPTION].to_numpy().tolist()
-
+        
         # Initialize embeddings dictionary
         embeddings_dict = {}
-
-        # Process descriptions in batches
-        num_batches = (len(descriptions) + config.BERT_BATCH_SIZE - 1) // config.BERT_BATCH_SIZE
-
+        
+        # Process in batches with progress bar
+        num_batches = (len(descriptions) + batch_size - 1) // batch_size
+        
+        print(f"   📊 Processing {len(descriptions)} books in {num_batches} batches (batch_size={batch_size})")
+        
         with torch.no_grad():
-            for batch_idx in tqdm(range(num_batches), desc="Processing BERT batches", unit="batch"):
-                start_idx = batch_idx * config.BERT_BATCH_SIZE
-                end_idx = min(start_idx + config.BERT_BATCH_SIZE, len(descriptions))
+            for batch_idx in tqdm(range(num_batches), desc="   BERT Progress", unit="batch"):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(descriptions))
                 batch_descriptions = descriptions[start_idx:end_idx]
                 batch_book_ids = book_ids[start_idx:end_idx]
-
+                
+                # Skip empty batches
+                if not batch_descriptions:
+                    continue
+                
                 # Tokenize batch
                 encoded = tokenizer(
                     batch_descriptions,
@@ -330,90 +105,194 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
                     max_length=config.BERT_MAX_LENGTH,
                     return_tensors="pt",
                 )
-
-                # Move to device
-                encoded = {k: v.to(config.BERT_DEVICE) for k, v in encoded.items()}
-
-                # Get model outputs
+                encoded = {k: v.to(device) for k, v in encoded.items()}
+                
+                # Get embeddings
                 outputs = model(**encoded)
-
-                # Mean pooling: average over sequence length dimension
-                # outputs.last_hidden_state shape: (batch_size, seq_len, hidden_size)
-                attention_mask = encoded["attention_mask"]
-                # Expand attention mask to match hidden_size dimension for broadcasting
-                attention_mask_expanded = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
-
-                # Sum embeddings, weighted by attention mask
-                sum_embeddings = torch.sum(outputs.last_hidden_state * attention_mask_expanded, dim=1)
-                # Sum attention mask values for normalization
-                sum_mask = torch.clamp(attention_mask_expanded.sum(dim=1), min=1e-9)
-
+                
                 # Mean pooling
+                attention_mask = encoded["attention_mask"]
+                attention_mask_expanded = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
+                
+                sum_embeddings = torch.sum(outputs.last_hidden_state * attention_mask_expanded, dim=1)
+                sum_mask = torch.clamp(attention_mask_expanded.sum(dim=1), min=1e-9)
                 mean_pooled = sum_embeddings / sum_mask
-
-                # Convert to numpy and store
+                
+                # Move to CPU and store
                 batch_embeddings = mean_pooled.cpu().numpy()
-
+                
                 for book_id, embedding in zip(batch_book_ids, batch_embeddings, strict=False):
                     embeddings_dict[book_id] = embedding
-
-                # Small pause between batches to let GPU cool down and prevent overheating
-                if config.BERT_DEVICE == "cuda":
-                    time.sleep(0.2)  # 200ms pause between batches
-
-        # Save embeddings for future use
-        joblib.dump(embeddings_dict, embeddings_path)
-        print(f"Saved BERT embeddings to {embeddings_path}")
-
-    # Map embeddings to DataFrame rows by book_id
+                
+                # Очистка памяти после каждого батча
+                del encoded, outputs, mean_pooled, batch_embeddings
+                cleanup_gpu_memory()
+                
+                # Пауза для предотвращения перегрева
+                if device.startswith("cuda"):
+                    time.sleep(0.05)
+        
+        # Save embeddings
+        print(f"   💾 Saving BERT embeddings to {embeddings_path}")
+        joblib.dump(embeddings_dict, embeddings_path, compress=3)
+        
+        # Очищаем память после завершения
+        del model, tokenizer
+        cleanup_gpu_memory()
+        print(f"   ✅ BERT embeddings computed and saved ({len(embeddings_dict)} embeddings)")
+    
+    # Map embeddings to DataFrame
+    print(f"   🔗 Mapping embeddings to {len(df)} rows...")
     df_book_ids = df[constants.COL_BOOK_ID].to_numpy()
-
-    # Create embedding matrix
     embeddings_list = []
+    
+    missing_count = 0
     for book_id in df_book_ids:
         if book_id in embeddings_dict:
             embeddings_list.append(embeddings_dict[book_id])
         else:
-            # Zero embedding for books without descriptions
             embeddings_list.append(np.zeros(config.BERT_EMBEDDING_DIM))
-
+            missing_count += 1
+    
+    if missing_count > 0:
+        print(f"   ⚠️  {missing_count} books without BERT embeddings (using zeros)")
+    
     embeddings_array = np.array(embeddings_list)
-
-    # Create DataFrame with BERT features
+    
+    # Create BERT features DataFrame
     bert_feature_names = [f"bert_{i}" for i in range(config.BERT_EMBEDDING_DIM)]
     bert_df = pd.DataFrame(embeddings_array, columns=bert_feature_names, index=df.index)
-
-    # Concatenate BERT features with main DataFrame
+    
+    # Concatenate with main DataFrame
     df_with_bert = pd.concat([df.reset_index(drop=True), bert_df.reset_index(drop=True)], axis=1)
-
-    print(f"Added {len(bert_feature_names)} BERT features.")
+    
+    print(f"   ✅ Added {len(bert_feature_names)} BERT features")
     return df_with_bert
 
 
-def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
-    """Fills missing values using a defined strategy.
+def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds TF-IDF features from book descriptions."""
+    print("\n📝 Adding text features (TF-IDF)...")
 
-    Fills missing values for age, aggregated features, and categorical features
-    to prepare the DataFrame for model training. Uses metrics from the training
-    set (e.g., global mean) to fill NaNs.
+    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    vectorizer_path = config.MODEL_DIR / constants.TFIDF_VECTORIZER_FILENAME
 
-    Args:
-        df (pd.DataFrame): The DataFrame with missing values.
-        train_df (pd.DataFrame): The training data, used for calculating fill metrics.
+    # Get unique books from train set
+    train_books = train_df[constants.COL_BOOK_ID].unique()
+    train_descriptions = descriptions_df[descriptions_df[constants.COL_BOOK_ID].isin(train_books)].copy()
+    train_descriptions[constants.COL_DESCRIPTION] = train_descriptions[constants.COL_DESCRIPTION].fillna("")
 
-    Returns:
-        pd.DataFrame: The DataFrame with missing values handled.
-    """
-    print("Handling missing values...")
+    # Load or fit vectorizer
+    if vectorizer_path.exists():
+        print(f"   📂 Loading existing vectorizer from {vectorizer_path}")
+        vectorizer = joblib.load(vectorizer_path)
+    else:
+        print(f"   ⚙️  Fitting TF-IDF vectorizer on {len(train_descriptions)} training descriptions...")
+        vectorizer = TfidfVectorizer(
+            max_features=config.TFIDF_MAX_FEATURES,
+            min_df=config.TFIDF_MIN_DF,
+            max_df=config.TFIDF_MAX_DF,
+            ngram_range=config.TFIDF_NGRAM_RANGE,
+        )
+        vectorizer.fit(train_descriptions[constants.COL_DESCRIPTION])
+        joblib.dump(vectorizer, vectorizer_path)
+        print(f"   💾 Vectorizer saved to {vectorizer_path}")
 
-    # Calculate global mean from training data for filling
+    # Transform all descriptions
+    all_descriptions = descriptions_df[[constants.COL_BOOK_ID, constants.COL_DESCRIPTION]].copy()
+    all_descriptions[constants.COL_DESCRIPTION] = all_descriptions[constants.COL_DESCRIPTION].fillna("")
+    description_map = dict(
+        zip(all_descriptions[constants.COL_BOOK_ID], all_descriptions[constants.COL_DESCRIPTION], strict=False)
+    )
+
+    df_descriptions = df[constants.COL_BOOK_ID].map(description_map).fillna("")
+    tfidf_matrix = vectorizer.transform(df_descriptions)
+
+    # Convert to DataFrame
+    tfidf_feature_names = [f"tfidf_{i}" for i in range(tfidf_matrix.shape[1])]
+    tfidf_df = pd.DataFrame(
+        tfidf_matrix.toarray(),
+        columns=tfidf_feature_names,
+        index=df.index,
+    )
+
+    df_with_tfidf = pd.concat([df.reset_index(drop=True), tfidf_df.reset_index(drop=True)], axis=1)
+    print(f"   ✅ Added {len(tfidf_feature_names)} TF-IDF features")
+    return df_with_tfidf
+
+
+def add_interaction_feature(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds binary interaction feature."""
+    print("\n🤝 Adding interaction feature...")
+
+    interaction_pairs = set(
+        zip(train_df[constants.COL_USER_ID], train_df[constants.COL_BOOK_ID], strict=False)
+    )
+
+    df[constants.F_USER_BOOK_INTERACTION] = df.apply(
+        lambda row: 1
+        if (row[constants.COL_USER_ID], row[constants.COL_BOOK_ID]) in interaction_pairs
+        else 0,
+        axis=1,
+    ).astype("int8")
+
+    interaction_count = df[constants.F_USER_BOOK_INTERACTION].sum()
+    print(f"   ✅ Interactions found: {interaction_count:,} / {len(df):,} ({100 * interaction_count / len(df):.1f}%)")
+    return df
+
+
+def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates aggregate features."""
+    print("\n📊 Adding aggregate features...")
+
+    # User aggregates
+    user_agg = train_df.groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    user_agg.columns = [
+        constants.COL_USER_ID,
+        constants.F_USER_MEAN_RATING,
+        constants.F_USER_RATINGS_COUNT,
+    ]
+
+    # Book aggregates
+    book_agg = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    book_agg.columns = [
+        constants.COL_BOOK_ID,
+        constants.F_BOOK_MEAN_RATING,
+        constants.F_BOOK_RATINGS_COUNT,
+    ]
+
+    # Author aggregates
+    author_agg = train_df.groupby(constants.COL_AUTHOR_ID)[config.TARGET].agg(["mean"]).reset_index()
+    author_agg.columns = [constants.COL_AUTHOR_ID, constants.F_AUTHOR_MEAN_RATING]
+
+    # Merge aggregates
+    df = df.merge(user_agg, on=constants.COL_USER_ID, how="left")
+    df = df.merge(book_agg, on=constants.COL_BOOK_ID, how="left")
+    df = df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
+    
+    print(f"   ✅ Added user, book, and author aggregates")
+    return df
+
+
+def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds genre count feature."""
+    print("\n📚 Adding genre features...")
+    genre_counts = book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID].count().reset_index()
+    genre_counts.columns = [constants.COL_BOOK_ID, constants.F_BOOK_GENRES_COUNT]
+    df_with_genres = df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
+    print(f"   ✅ Added genre count feature")
+    return df_with_genres
+
+
+def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """Fills missing values."""
+    print("\n🔧 Handling missing values...")
+
     global_mean = train_df[config.TARGET].mean()
-
-    # Fill age with the median
     age_median = df[constants.COL_AGE].median()
     df[constants.COL_AGE] = df[constants.COL_AGE].fillna(age_median)
 
-    # Fill aggregate features for "cold start" users/items (only if they exist)
+    # Fill aggregate features
     if constants.F_USER_MEAN_RATING in df.columns:
         df[constants.F_USER_MEAN_RATING] = df[constants.F_USER_MEAN_RATING].fillna(global_mean)
     if constants.F_BOOK_MEAN_RATING in df.columns:
@@ -426,39 +305,19 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     if constants.F_BOOK_RATINGS_COUNT in df.columns:
         df[constants.F_BOOK_RATINGS_COUNT] = df[constants.F_BOOK_RATINGS_COUNT].fillna(0)
 
-    # Fill missing avg_rating from book_data with global mean
     df[constants.COL_AVG_RATING] = df[constants.COL_AVG_RATING].fillna(global_mean)
-
-    # Fill genre counts with 0
     df[constants.F_BOOK_GENRES_COUNT] = df[constants.F_BOOK_GENRES_COUNT].fillna(0)
 
-    # Fill TF-IDF features with 0 (for books without descriptions)
+    # Fill text features
     tfidf_cols = [col for col in df.columns if col.startswith("tfidf_")]
     for col in tfidf_cols:
         df[col] = df[col].fillna(0.0)
 
-    # Fill BERT features with 0 (for books without descriptions)
     bert_cols = [col for col in df.columns if col.startswith("bert_")]
     for col in bert_cols:
         df[col] = df[col].fillna(0.0)
-    
-    # Fill new aggregate features with 0 или средними значениями
-    new_agg_features = [
-        'user_total_interactions', 'user_to_read_count', 'user_read_ratio', 'user_to_read_ratio',
-        'book_total_interactions', 'book_to_read_count', 'book_read_ratio', 'book_to_read_ratio', 'book_popularity',
-        'author_total_interactions', 'author_to_read_count', 'author_read_count', 'author_read_ratio'
-    ]
-    
-    for col in new_agg_features:
-        if col in df.columns:
-            if 'ratio' in col:
-                df[col] = df[col].fillna(0.5)  # Для ratio используем 0.5 как нейтральное значение
-            elif 'count' in col or 'interactions' in col or 'popularity' in col:
-                df[col] = df[col].fillna(0)  # Для счетчиков используем 0
-            else:
-                df[col] = df[col].fillna(0)
 
-    # Fill remaining categorical features with a special value
+    # Fill categorical features
     for col in config.CAT_FEATURES:
         if col in df.columns:
             if df[col].dtype.name in ("category", "object") and df[col].isna().any():
@@ -466,44 +325,54 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
             elif pd.api.types.is_numeric_dtype(df[col].dtype) and df[col].isna().any():
                 df[col] = df[col].fillna(constants.MISSING_NUM_VALUE)
 
+    print(f"   ✅ Missing values handled")
     return df
 
 
 def create_features(
-    df: pd.DataFrame, book_genres_df: pd.DataFrame, descriptions_df: pd.DataFrame, include_aggregates: bool = False
+    df: pd.DataFrame,
+    book_genres_df: pd.DataFrame,
+    descriptions_df: pd.DataFrame,
+    include_aggregates: bool = False,
+    include_bert: bool = True,
 ) -> pd.DataFrame:
-    """Runs the full feature engineering pipeline.
-
-    This function orchestrates the calls to add aggregate features (optional), genre
-    features, text features (TF-IDF and BERT), and handle missing values.
-
-    Args:
-        df (pd.DataFrame): The merged DataFrame from `data_processing`.
-        book_genres_df (pd.DataFrame): DataFrame mapping books to genres.
-        descriptions_df (pd.DataFrame): DataFrame with book descriptions.
-        include_aggregates (bool): If True, compute aggregate features. Defaults to False.
-            Aggregates are typically computed separately during training to avoid data leakage.
-
-    Returns:
-        pd.DataFrame: The final DataFrame with all features engineered.
-    """
-    print("Starting feature engineering pipeline...")
+    """Runs the full feature engineering pipeline."""
+    print("\n" + "=" * 60)
+    print("🚀 Starting feature engineering pipeline...")
+    print("=" * 60)
+    
+    # Очищаем память GPU перед началом
+    cleanup_gpu_memory()
+    
     train_df = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
 
-    # Aggregate features are computed separately during training to ensure
-    # no data leakage from validation set timestamps
+    # Add features in sequence
+    df = add_interaction_feature(df, train_df)
+    
     if include_aggregates:
         df = add_aggregate_features(df, train_df)
-
+    
     df = add_genre_features(df, book_genres_df)
     df = add_text_features(df, train_df, descriptions_df)
-    df = add_bert_features(df, train_df, descriptions_df)
+    
+    if include_bert:
+        df = add_bert_features_gpu(df, descriptions_df, config.BERT_DEVICE)
+    else:
+        print("\n⚠️  BERT features disabled (include_bert=False)")
+    
     df = handle_missing_values(df, train_df)
 
-    # Convert categorical columns to pandas 'category' dtype for LightGBM
+    # Convert categorical columns
     for col in config.CAT_FEATURES:
         if col in df.columns:
             df[col] = df[col].astype("category")
 
-    print("Feature engineering complete.")
+    print("\n" + "=" * 60)
+    print("✅ Feature engineering complete.")
+    print(f"   Final shape: {df.shape}")
+    print("=" * 60)
+    
+    # Очищаем память после завершения
+    cleanup_gpu_memory()
+    
     return df

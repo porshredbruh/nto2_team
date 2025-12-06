@@ -7,7 +7,8 @@ structure but are not intended to be tuned as hyperparameters.
 
 # --- FILENAMES ---
 TRAIN_FILENAME = "train.csv"
-TEST_FILENAME = "test.csv"
+TARGETS_FILENAME = "targets.csv"
+CANDIDATES_FILENAME = "candidates.csv"
 USER_DATA_FILENAME = "users.csv"
 BOOK_DATA_FILENAME = "books.csv"
 BOOK_GENRES_FILENAME = "book_genres.csv"
@@ -23,19 +24,23 @@ PROCESSED_DATA_FILENAME = "processed_features.parquet"
 # Main columns
 COL_USER_ID = "user_id"
 COL_BOOK_ID = "book_id"
-COL_TARGET = "rating"
+COL_TARGET = "has_read"  # Original target from train.csv
+COL_RELEVANCE = "relevance"  # New target for multiclass: 0=cold, 1=planned, 2=read
 COL_SOURCE = "source"
 COL_PREDICTION = "rating_predict"
 COL_HAS_READ = "has_read"
 COL_TIMESTAMP = "timestamp"
+COL_BOOK_ID_LIST = "book_id_list"
 
 # Feature columns (newly created)
-F_USER_MEAN_RATING = "user_mean_rating"
-F_USER_RATINGS_COUNT = "user_ratings_count"
-F_BOOK_MEAN_RATING = "book_mean_rating"
-F_BOOK_RATINGS_COUNT = "book_ratings_count"
-F_AUTHOR_MEAN_RATING = "author_mean_rating"
+# Note: These constants are reused from Stage 1, but will compute mean(has_read) instead of mean(rating)
+F_USER_MEAN_RATING = "user_mean_rating"  # Will be mean(has_read) for user
+F_USER_RATINGS_COUNT = "user_ratings_count"  # Will be count of interactions for user
+F_BOOK_MEAN_RATING = "book_mean_rating"  # Will be mean(has_read) for book
+F_BOOK_RATINGS_COUNT = "book_ratings_count"  # Will be count of interactions for book
+F_AUTHOR_MEAN_RATING = "author_mean_rating"  # Will be mean(has_read) for author
 F_BOOK_GENRES_COUNT = "book_genres_count"
+F_USER_BOOK_INTERACTION = "f_user_book_interaction"  # Binary: 1 if (user_id, book_id) in train.csv, else 0
 
 # Metadata columns from raw data
 COL_GENDER = "gender"
@@ -57,4 +62,6 @@ VAL_SOURCE_TEST = "test"
 MISSING_CAT_VALUE = "-1"
 MISSING_NUM_VALUE = -1
 PREDICTION_MIN_VALUE = 0
-PREDICTION_MAX_VALUE = 10
+PREDICTION_MAX_VALUE = 2  # Changed: now 3 classes (0, 1, 2) instead of regression
+MAX_RANKING_LENGTH = 20
+

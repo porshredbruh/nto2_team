@@ -1,24 +1,13 @@
 [project]
-name = "individual-stage-baseline"
+name = "team-stage-baseline"
 version = "0.1.0"
 description = ""
 authors = [
     {name = "werserk",email = "werserk@inbox.ru"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "pandas (>=2.3.3,<3.0.0)",
-    "scikit-learn (>=1.7.2,<2.0.0)",
-    "lightgbm (>=4.6.0,<5.0.0)",
-    "joblib (>=1.5.2,<2.0.0)",
-    "transformers (>=4.30.0)",
-    "torch (>=2.0.0)",
-    "sentencepiece (>=0.1.99)",
-    "gdown (>=5.2.0,<6.0.0)",
-    "tqdm (>=4.67.1,<5.0.0)",
-    "pyarrow (>=22.0.0,<23.0.0)",
-]
+requires-python = ">=3.10,<3.15"
+dependencies = ["pandas (>=2.3.3,<3.0.0)", "scikit-learn (>=1.7.2,<2.0.0)", "lightgbm (>=4.6.0,<5.0.0)", "joblib (>=1.5.2,<2.0.0)", "transformers (>=4.57.1,<5.0.0)", "torch (>=2.9.0,<3.0.0)", "sentencepiece (>=0.2.1,<0.3.0)", "gdown (>=5.2.0,<6.0.0)", "tqdm (>=4.67.1,<5.0.0)", "pyarrow (>=22.0.0,<23.0.0)"]
 
 
 [tool.poetry]
@@ -29,7 +18,7 @@ requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
-ruff = "^0.14.2"
+ruff = "^0.14.3"
 pre-commit = "^4.3.0"
 
 [tool.ruff]

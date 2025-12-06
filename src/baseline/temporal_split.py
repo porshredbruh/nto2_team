@@ -101,3 +101,4 @@ def get_split_date_from_ratio(
     threshold_index = int(len(sorted_timestamps) * ratio)
 
     return sorted_timestamps.iloc[threshold_index]
+
