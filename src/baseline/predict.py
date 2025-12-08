@@ -1,36 +1,23 @@
 """
-Inference script to generate predictions for the test set.
-
-Computes aggregate features on all train data and applies them to test set,
-then generates predictions using the trained model and ranks candidates for each user.
+Enhanced inference script with ensemble predictions.
 """
 
 import numpy as np
-
-import lightgbm as lgb
 import pandas as pd
+import lightgbm as lgb
+import joblib
+import json
+import warnings
+warnings.filterwarnings('ignore')
 
 from . import config, constants
 from .data_processing import expand_candidates, load_and_merge_data
 from .features import add_aggregate_features, handle_missing_values
 
 
-def predict() -> None:
-    """Generates and saves ranked predictions for the test set.
-
-    This script:
-    1. Loads targets.csv and candidates.csv
-    2. Expands candidates into (user_id, book_id) pairs
-    3. Computes aggregate features on all train data
-    4. Generates probabilities for 3 classes using the trained multiclass model
-       (class 0=cold, 1=planned, 2=read)
-    5. Calculates ranking score: p1*1 + p2*2 (weighted sum based on relevance)
-    6. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
-    7. Saves submission.csv in format: user_id,book_id_list
-
-    Note: Data must be prepared first using prepare_data.py, and model must be trained
-    using train.py
-    """
+def predict_with_ensemble() -> None:
+    """Generates ensemble predictions for the test set."""
+    
     # Load targets and candidates
     print("Loading targets and candidates...")
     targets_df = pd.read_csv(
@@ -66,7 +53,6 @@ def predict() -> None:
     # Load metadata for candidates
     print("Loading metadata...")
     _, _, _, book_genres_df, descriptions_df = load_and_merge_data()
-    # We need users and books data separately
     user_data_df = pd.read_csv(config.RAW_DATA_DIR / constants.USER_DATA_FILENAME)
     book_data_df = pd.read_csv(config.RAW_DATA_DIR / constants.BOOK_DATA_FILENAME)
 
@@ -76,42 +62,35 @@ def predict() -> None:
     book_data_df = book_data_df.drop_duplicates(subset=[constants.COL_BOOK_ID])
     candidates_with_meta = candidates_with_meta.merge(book_data_df, on=constants.COL_BOOK_ID, how="left")
 
-    # Add base features from prepared data (genres, text features)
-    # We'll match by book_id to get TF-IDF and BERT features
-    book_features = featured_df[[constants.COL_BOOK_ID]].drop_duplicates()
-    # Get all feature columns except metadata and source columns
-    feature_cols = [
-        col
-        for col in featured_df.columns
-        if col
-        not in [
-            constants.COL_USER_ID,
-            constants.COL_BOOK_ID,
-            constants.COL_SOURCE,
-            constants.COL_TIMESTAMP,
-            constants.COL_HAS_READ,
-            constants.COL_TARGET,
-            constants.COL_PREDICTION,
-            constants.COL_GENDER,
-            constants.COL_AGE,
-            constants.COL_AUTHOR_ID,
-            constants.COL_PUBLICATION_YEAR,
-            constants.COL_LANGUAGE,
-            constants.COL_PUBLISHER,
-            constants.COL_AVG_RATING,
-        ]
-        and not col.startswith("tfidf_")
-        and not col.startswith("bert_")
+    # Add base features from prepared data
+    print("Adding base features...")
+    
+    # Identify feature columns from prepared data
+    exclude_base_cols = [
+        constants.COL_USER_ID,
+        constants.COL_BOOK_ID,
+        constants.COL_SOURCE,
+        constants.COL_TIMESTAMP,
+        constants.COL_HAS_READ,
+        config.TARGET,
+        constants.COL_PREDICTION,
+        constants.COL_GENDER,
+        constants.COL_AGE,
+        constants.COL_AUTHOR_ID,
+        constants.COL_PUBLICATION_YEAR,
+        constants.COL_LANGUAGE,
+        constants.COL_PUBLISHER,
+        constants.COL_AVG_RATING,
     ]
-
-    # Add genre count and text features
-    # Get a representative row for each book (just take first occurrence)
+    
+    feature_cols = [col for col in featured_df.columns if col not in exclude_base_cols]
+    
+    # Get a representative row for each book
     book_features_df = featured_df[[constants.COL_BOOK_ID] + feature_cols].drop_duplicates(
         subset=[constants.COL_BOOK_ID]
     )
 
-    # Merge book features - drop duplicate columns before merge
-    # Remove columns that will be merged from candidates_with_meta if they exist
+    # Merge book features
     cols_to_drop = [col for col in feature_cols if col in candidates_with_meta.columns]
     if cols_to_drop:
         candidates_with_meta = candidates_with_meta.drop(columns=cols_to_drop)
@@ -120,9 +99,10 @@ def predict() -> None:
         book_features_df, on=constants.COL_BOOK_ID, how="left"
     )
 
-    # Get TF-IDF and BERT features from prepared data
+    # Add text features
+    print("Adding text features...")
     tfidf_cols = [col for col in featured_df.columns if col.startswith("tfidf_")]
-    bert_cols = [col for col in featured_df.columns if col.startswith("bert_")]
+    bert_cols = [col for col in featured_df.columns if col.startswith("bert")]
     text_feature_cols = tfidf_cols + bert_cols
 
     if text_feature_cols:
@@ -142,7 +122,6 @@ def predict() -> None:
     candidates_final = handle_missing_values(candidates_with_agg, train_df)
 
     # Load feature list saved during training
-    import json
     features_path = config.MODEL_DIR / "features_list.json"
     if features_path.exists():
         print("Loading feature list from training...")
@@ -150,131 +129,219 @@ def predict() -> None:
             features = json.load(f)
         print(f"Loaded {len(features)} features from training")
     else:
-        # Fallback: use same logic as training
-        print("Warning: Feature list not found, using fallback logic")
-        exclude_cols = [
-            constants.COL_SOURCE,
-            config.TARGET,
-            constants.COL_PREDICTION,
-            constants.COL_TIMESTAMP,
+        print("Warning: Feature list not found, using all available features")
+        exclude_cols = exclude_base_cols + [
+            constants.COL_USER_ID,
+            constants.COL_BOOK_ID,
         ]
-        train_features = [col for col in train_df.columns if col not in exclude_cols]
-        train_non_feature_object_cols = train_df[train_features].select_dtypes(include=["object"]).columns.tolist()
-        features = [f for f in train_features if f not in train_non_feature_object_cols]
+        features = [col for col in candidates_final.columns if col not in exclude_cols]
 
-    # Remove any columns that shouldn't be features (like title, author_name, etc.)
-    exclude_cols = [
-        constants.COL_SOURCE,
-        config.TARGET,
-        constants.COL_PREDICTION,
-        constants.COL_TIMESTAMP,
-        constants.COL_USER_ID,
-        constants.COL_BOOK_ID,
-    ]
-    candidates_final = candidates_final.drop(
-        columns=[col for col in candidates_final.columns if col not in features and col not in exclude_cols + [constants.COL_USER_ID, constants.COL_BOOK_ID]],
-        errors="ignore"
-    )
-
-    # Add missing features with default values
+    # Ensure all features exist
     missing_features = [f for f in features if f not in candidates_final.columns]
     if missing_features:
-        print(f"Warning: Missing {len(missing_features)} features in candidates, adding defaults")
+        print(f"Warning: Missing {len(missing_features)} features, adding defaults")
         for feat in missing_features:
-            if feat in train_df.columns:
-                if train_df[feat].dtype.name == "category":
-                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
-                else:
-                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
-            else:
-                candidates_final[feat] = 0
+            candidates_final[feat] = 0.0
 
-    # Ensure all features exist in candidates_final (add missing ones)
-    # features list is from training, so we need all of them
-    for feat in features:
-        if feat not in candidates_final.columns:
-            # Add with default value
-            if feat in train_df.columns:
-                if train_df[feat].dtype.name == "category":
-                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
-                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
-                else:
-                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
-            else:
-                candidates_final[feat] = 0
+    # Keep only necessary columns
+    keep_cols = features + [constants.COL_USER_ID, constants.COL_BOOK_ID]
+    candidates_final = candidates_final[keep_cols]
 
-    # Final check: ensure we have all features in the exact order
-    features = [f for f in features if f in candidates_final.columns]
-
-    # Convert categorical columns to pandas 'category' dtype for LightGBM (same as in train.py)
-    # Use categories from featured_df (processed data) to ensure they match training data
-    # This is critical: LightGBM requires exact match of categorical features
-    # Only process columns that were actually categorical in training data
+    # Критически важная часть: правильная обработка категориальных признаков
+    print("\n🎯 Critical step: Preparing categorical features for LightGBM...")
+    
+    # Загружаем информацию о категориальных признаках из обучающих данных
+    train_categorical_info = {}
     for col in features:
-        if col in featured_df.columns and featured_df[col].dtype.name == "category":
-            # Get categories from processed training data
-            train_categories = list(featured_df[col].cat.categories)
-
-            # Convert to string first to handle any type mismatches
-            candidates_final[col] = candidates_final[col].astype(str)
-
-            # Replace any values not in train categories with first train category
-            valid_mask = candidates_final[col].isin([str(cat) for cat in train_categories])
-            if not valid_mask.all():
-                invalid_count = (~valid_mask).sum()
-                print(f"Warning: {invalid_count} values in {col} not in training categories, replacing with first category")
-                candidates_final.loc[~valid_mask, col] = str(train_categories[0]) if len(train_categories) > 0 else "0"
-
-            # Convert categories back to original type and create categorical
-            # Convert train_categories to same type as in training
-            train_cat_values = [str(cat) for cat in train_categories]
-            candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_cat_values, ordered=False)
-
-            # Convert categorical codes back to original type if needed
-            # This ensures the internal representation matches training
-            if len(train_categories) > 0:
-                # Re-map to original category values
-                candidates_final[col] = candidates_final[col].astype(str).map(
-                    {str(cat): cat for cat in train_categories}
-                ).fillna(train_categories[0])
-                candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories, ordered=False)
+        if col in train_df.columns and train_df[col].dtype.name == "category":
+            # Сохраняем категории из обучающих данных
+            train_categories = list(train_df[col].cat.categories)
+            train_categorical_info[col] = train_categories
+            print(f"   Found categorical feature: {col} with {len(train_categories)} categories")
+    
+    # Преобразуем категориальные признаки в тестовых данных
+    for col in features:
+        if col in train_categorical_info:
+            # Этот признак был категориальным при обучении
+            train_categories = train_categorical_info[col]
+            
+            if col not in candidates_final.columns:
+                print(f"   ⚠️  Categorical feature {col} not in test data, adding default")
+                candidates_final[col] = train_categories[0] if train_categories else "missing"
+            else:
+                # Преобразуем в строки и заменяем значения, которых нет в обучающих категориях
+                candidates_final[col] = candidates_final[col].astype(str)
+                
+                # Находим значения, которых нет в обучающих категориях
+                unique_vals = set(candidates_final[col].unique())
+                train_vals_set = set(train_categories)
+                unknown_vals = unique_vals - train_vals_set
+                
+                if unknown_vals:
+                    print(f"   ⚠️  Feature {col} has {len(unknown_vals)} unknown values, replacing with first category")
+                    # Заменяем неизвестные значения первой категорией
+                    candidates_final.loc[candidates_final[col].isin(unknown_vals), col] = train_categories[0] if train_categories else "missing"
+                
+                # Создаем категориальный тип с теми же категориями, что и в обучающих данных
+                candidates_final[col] = pd.Categorical(
+                    candidates_final[col],
+                    categories=train_categories,
+                    ordered=False
+                )
+        else:
+            # Признак не был категориальным при обучении
+            if col in candidates_final.columns:
+                if candidates_final[col].dtype.name == "category":
+                    # Если в тестовых данных он категориальный, но не был при обучении - преобразуем в строку
+                    candidates_final[col] = candidates_final[col].astype(str)
+                elif candidates_final[col].dtype.name == "object":
+                    # Object тип также преобразуем в строку
+                    candidates_final[col] = candidates_final[col].astype(str)
+    
+    print(f"✅ Categorical features prepared for LightGBM")
 
     X_test = candidates_final[features]
     print(f"Prediction features: {len(features)}")
+    print(f"Test data shape: {X_test.shape}")
+    
+    # Проверяем типы данных перед предсказанием
+    print("\n🔍 Checking data types before prediction...")
+    dtypes_summary = X_test.dtypes.value_counts()
+    for dtype, count in dtypes_summary.items():
+        print(f"   {dtype}: {count} columns")
+    
+    # Убедимся, что нет datetime типов
+    datetime_cols = X_test.select_dtypes(include=['datetime64', 'timedelta64']).columns
+    if len(datetime_cols) > 0:
+        print(f"   ⚠️  Found datetime columns: {list(datetime_cols)}")
+        # Преобразуем их в числовые (timestamp)
+        for col in datetime_cols:
+            X_test[col] = X_test[col].astype(np.int64) // 10**9
 
-    # Load trained model
-    model_path = config.MODEL_DIR / config.MODEL_FILENAME
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model not found at {model_path}. " "Please run 'poetry run python -m src.baseline.train' first."
-        )
+    # Load models for ensemble
+    print("\n🤖 Loading ensemble models...")
+    
+    # Load LightGBM model
+    lgb_path = config.MODEL_DIR / config.MODEL_FILENAME
+    if not lgb_path.exists():
+        raise FileNotFoundError(f"LightGBM model not found at {lgb_path}")
+    
+    print(f"Loading LightGBM model from {lgb_path}...")
+    lgb_model = lgb.Booster(model_file=str(lgb_path))
+    
+    # Try to load CatBoost model
+    cb_path = config.MODEL_DIR / config.CATBOOST_MODEL_FILENAME
+    use_catboost = False
+    cb_model = None
+    
+    if cb_path.exists():
+        try:
+            import catboost as cb
+            print(f"Loading CatBoost model from {cb_path}...")
+            cb_model = cb.CatBoostClassifier()
+            cb_model.load_model(str(cb_path))
+            use_catboost = True
+            print("✅ CatBoost model loaded")
+        except Exception as e:
+            print(f"⚠️  Failed to load CatBoost model: {e}")
+    else:
+        print("ℹ️  CatBoost model not found, using LightGBM only")
 
-    print(f"\nLoading model from {model_path}...")
-    # Load Booster directly
-    model = lgb.Booster(model_file=str(model_path))
-
-    # Generate probabilities for multiclass (3 classes)
-    # For multiclass, Booster.predict() returns probabilities for all classes
-    # Shape: (n_samples, 3) with [p0, p1, p2] for each sample
-    # p0 = probability of class 0 (cold candidates)
-    # p1 = probability of class 1 (planned books)
-    # p2 = probability of class 2 (read books)
-    print("Generating predictions...")
-    test_proba_all = model.predict(X_test)  # Returns probabilities for all classes
-    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, 3)
-    test_proba_all = np.array(test_proba_all)
-    if test_proba_all.ndim == 1:
-        # If it's 1D, reshape to (n_samples, 3)
-        test_proba_all = test_proba_all.reshape(-1, 3)
-
-    # Calculate ranking score: weighted sum of probabilities
-    # ranking_score = p0*0 + p1*1 + p2*2 = p1 + 2*p2
-    # Higher score = higher relevance (read books > planned books > cold candidates)
-    test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
-
-    # Add predictions to candidates dataframe
-    candidates_final["prediction"] = test_proba
+    # Generate predictions
+    print("\nGenerating ensemble predictions...")
+    
+    # LightGBM predictions - ОЧЕНЬ ВАЖНО: преобразуем данные в правильный формат
+    print("Preparing data for LightGBM prediction...")
+    
+    # Для LightGBM нужно явно указать категориальные признаки
+    # Получаем индексы категориальных признаков
+    categorical_indices = []
+    for i, col in enumerate(features):
+        if col in train_categorical_info:
+            categorical_indices.append(i)
+    
+    print(f"   LightGBM will use {len(categorical_indices)} categorical features")
+    
+    # Преобразуем DataFrame в numpy массив для LightGBM
+    # LightGBM может работать с pandas DataFrame, но лучше явно указать категориальные признаки
+    X_test_for_lgb = X_test.copy()
+    
+    # Для LightGBM нужно преобразовать категориальные признаки в целочисленные коды
+    for col_idx, col in enumerate(features):
+        if col in train_categorical_info:
+            # Уже категориальный тип, LightGBM сам преобразует в коды
+            pass
+    
+    # Делаем предсказание LightGBM
+    print("Making LightGBM predictions...")
+    try:
+        lgb_proba_all = lgb_model.predict(X_test_for_lgb)
+        lgb_proba_all = np.array(lgb_proba_all)
+        if lgb_proba_all.ndim == 1:
+            lgb_proba_all = lgb_proba_all.reshape(-1, 3)
+        print(f"   LightGBM predictions shape: {lgb_proba_all.shape}")
+    except Exception as e:
+        print(f"❌ LightGBM prediction failed: {e}")
+        # Попробуем альтернативный подход
+        print("   Trying alternative prediction method...")
+        X_test_array = X_test_for_lgb.values.astype(np.float32)
+        lgb_proba_all = lgb_model.predict(X_test_array)
+        lgb_proba_all = np.array(lgb_proba_all)
+        if lgb_proba_all.ndim == 1:
+            lgb_proba_all = lgb_proba_all.reshape(-1, 3)
+        print(f"   LightGBM predictions shape: {lgb_proba_all.shape}")
+    
+    if use_catboost and cb_model is not None:
+        # CatBoost predictions
+        print("Generating CatBoost predictions...")
+        
+        # Prepare data for CatBoost
+        # CatBoost требует особого формата категориальных признаков
+        X_test_cb = X_test.copy()
+        categorical_features_for_cb = [col for col in features if col in train_categorical_info]
+        categorical_indices_cb = [features.index(f) for f in categorical_features_for_cb if f in features]
+        
+        # CatBoost требует, чтобы категориальные признаки были строковыми
+        for col in categorical_features_for_cb:
+            if col in X_test_cb.columns:
+                X_test_cb[col] = X_test_cb[col].astype(str).fillna("missing")
+        
+        try:
+            cb_proba_all = cb_model.predict_proba(X_test_cb)
+            print(f"   CatBoost predictions shape: {cb_proba_all.shape}")
+            
+            # Ensemble weights (можно настроить)
+            lgb_weight = 0.6
+            cb_weight = 0.4
+            
+            ensemble_proba = lgb_weight * lgb_proba_all + cb_weight * cb_proba_all
+            print(f"   Ensemble weights: LightGBM={lgb_weight}, CatBoost={cb_weight}")
+        except Exception as e:
+            print(f"⚠️  CatBoost prediction failed: {e}")
+            print("   Using LightGBM predictions only")
+            ensemble_proba = lgb_proba_all
+    else:
+        ensemble_proba = lgb_proba_all
+        print("Using LightGBM predictions only")
+    
+    # Enhanced ranking score calculation
+    print("Calculating enhanced ranking scores...")
+    
+    # Веса классов
+    class_weights = np.array([0.0, 1.0, 3.0])  # cold: 0, planned: 1, read: 3
+    
+    # Базовый скор
+    ranking_scores = np.sum(ensemble_proba * class_weights, axis=1)
+    
+    # Добавляем поправку на уверенность модели
+    confidence = np.max(ensemble_proba, axis=1)
+    ranking_scores = ranking_scores * (0.3 + 0.7 * confidence)
+    
+    # Добавляем поправку на разницу между классами 2 и 1
+    proba_diff = ensemble_proba[:, 2] - ensemble_proba[:, 1]
+    ranking_scores = ranking_scores * (1.0 + 0.5 * np.tanh(proba_diff))
+    
+    candidates_final["prediction"] = ranking_scores
 
     # Rank candidates for each user and select top-K
     print("\nRanking candidates for each user...")
@@ -308,14 +375,24 @@ def predict() -> None:
 
     # Save submission
     submission_df.to_csv(submission_path, index=False)
-    print(f"\nSubmission file created at: {submission_path}")
-    print(f"Submission shape: {submission_df.shape}")
+    print(f"\n✅ Submission file created at: {submission_path}")
+    print(f"   Submission shape: {submission_df.shape}")
 
     # Print statistics
     non_empty = submission_df[submission_df[constants.COL_BOOK_ID_LIST] != ""].shape[0]
-    print(f"Users with recommendations: {non_empty}/{len(submission_df)}")
+    avg_books = submission_df[constants.COL_BOOK_ID_LIST].apply(
+        lambda x: len(x.split(",")) if x else 0
+    ).mean()
+    
+    print(f"📊 Submission statistics:")
+    print(f"   Users with recommendations: {non_empty}/{len(submission_df)}")
+    print(f"   Average books per user: {avg_books:.2f}")
+    
+    # Сохраняем также предсказания для анализа
+    predictions_path = config.SUBMISSION_DIR / "predictions_with_scores.parquet"
+    candidates_final[["user_id", "book_id", "prediction"]].to_parquet(predictions_path)
+    print(f"   Detailed predictions saved to: {predictions_path}")
 
 
 if __name__ == "__main__":
-    predict()
-
+    predict_with_ensemble()

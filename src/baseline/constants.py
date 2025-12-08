@@ -1,8 +1,5 @@
 """
-Project-wide constants.
-
-This module defines constants that are part of the data schema or project
-structure but are not intended to be tuned as hyperparameters.
+Project-wide constants with enhancements.
 """
 
 # --- FILENAMES ---
@@ -24,25 +21,24 @@ PROCESSED_DATA_FILENAME = "processed_features.parquet"
 # Main columns
 COL_USER_ID = "user_id"
 COL_BOOK_ID = "book_id"
-COL_TARGET = "has_read"  # Original target from train.csv
-COL_RELEVANCE = "relevance"  # New target for multiclass: 0=cold, 1=planned, 2=read
+COL_TARGET = "has_read"
+COL_RELEVANCE = "relevance"
 COL_SOURCE = "source"
 COL_PREDICTION = "rating_predict"
 COL_HAS_READ = "has_read"
 COL_TIMESTAMP = "timestamp"
 COL_BOOK_ID_LIST = "book_id_list"
 
-# Feature columns (newly created)
-# Note: These constants are reused from Stage 1, but will compute mean(has_read) instead of mean(rating)
-F_USER_MEAN_RATING = "user_mean_rating"  # Will be mean(has_read) for user
-F_USER_RATINGS_COUNT = "user_ratings_count"  # Will be count of interactions for user
-F_BOOK_MEAN_RATING = "book_mean_rating"  # Will be mean(has_read) for book
-F_BOOK_RATINGS_COUNT = "book_ratings_count"  # Will be count of interactions for book
-F_AUTHOR_MEAN_RATING = "author_mean_rating"  # Will be mean(has_read) for author
+# Feature columns
+F_USER_MEAN_RATING = "user_mean_rating"
+F_USER_RATINGS_COUNT = "user_ratings_count"
+F_BOOK_MEAN_RATING = "book_mean_rating"
+F_BOOK_RATINGS_COUNT = "book_ratings_count"
+F_AUTHOR_MEAN_RATING = "author_mean_rating"
 F_BOOK_GENRES_COUNT = "book_genres_count"
-F_USER_BOOK_INTERACTION = "f_user_book_interaction"  # Binary: 1 if (user_id, book_id) in train.csv, else 0
+F_USER_BOOK_INTERACTION = "f_user_book_interaction"
 
-# Metadata columns from raw data
+# Metadata columns
 COL_GENDER = "gender"
 COL_AGE = "age"
 COL_AUTHOR_ID = "author_id"
@@ -53,7 +49,6 @@ COL_AVG_RATING = "avg_rating"
 COL_GENRE_ID = "genre_id"
 COL_DESCRIPTION = "description"
 
-
 # --- VALUES ---
 VAL_SOURCE_TRAIN = "train"
 VAL_SOURCE_TEST = "test"
@@ -62,6 +57,39 @@ VAL_SOURCE_TEST = "test"
 MISSING_CAT_VALUE = "-1"
 MISSING_NUM_VALUE = -1
 PREDICTION_MIN_VALUE = 0
-PREDICTION_MAX_VALUE = 2  # Changed: now 3 classes (0, 1, 2) instead of regression
+PREDICTION_MAX_VALUE = 2
 MAX_RANKING_LENGTH = 20
 
+# --- NEW FEATURE CATEGORIES ---
+TEMPORAL_FEATURES = [
+    'user_first_interaction',
+    'user_last_interaction', 
+    'user_total_interactions',
+    'user_activity_days',
+    'user_avg_days_between',
+    'user_read_ratio',
+    'user_planned_ratio',
+    'book_first_interaction',
+    'book_last_interaction',
+    'book_total_interactions',
+    'book_read_ratio',
+    'book_planned_ratio',
+]
+
+SEQUENCE_FEATURES = [
+    'user_avg_hours_between',
+    'user_conversions',
+    'user_active_hour',
+    'user_active_day',
+]
+
+COLLABORATIVE_FEATURES = [
+    'user_svd_',
+    'item_svd_', 
+    'cf_score_',
+]
+
+# --- MODEL TYPES ---
+MODEL_LIGHTGBM = "lightgbm"
+MODEL_CATBOOST = "catboost"
+MODEL_ENSEMBLE = "ensemble"
